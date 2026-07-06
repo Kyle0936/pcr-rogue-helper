@@ -13,16 +13,19 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import ctypes
 import html
 import http.server
 import io
 import json
+import queue
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 import webbrowser
 from dataclasses import dataclass
@@ -867,6 +870,277 @@ def configure_combos_ui(
         return None
 
 
+def user_friendly_log(line: str) -> str:
+    text = line.strip()
+    if not text:
+        return ""
+    if "Using ADB:" in text:
+        return "正在连接雷电模拟器。"
+    if "Physical size:" in text or "Override size:" in text:
+        return f"已连接模拟器，当前分辨率：{text}"
+    if "Valid combos:" in text:
+        return "已读取有效 Boss 组合，开始刷新流程。"
+    if "waiting detect5" in text:
+        return "正在识别五王信息。"
+    if "waiting detect3" in text:
+        return "正在识别三王信息。"
+    if "boss5=" in text:
+        boss = text.split("boss5=", 1)[1].split()[0]
+        return f"五王识别结果：{boss}。"
+    if "boss3=" in text:
+        boss = text.split("boss3=", 1)[1].split()[0]
+        return f"三王识别结果：{boss}。"
+    if "VALID COMBO:" in text:
+        return "成功找到符合条件的 Boss 组合，工具已停止。"
+    if "Invalid combo" in text:
+        return "当前组合不符合条件，继续下一轮。"
+    if "cannot make a valid combo" in text:
+        return "当前五王不符合条件，继续下一轮。"
+    if "Unknown/interstitial screen" in text:
+        return "检测到提示或弹窗，正在尝试跳过。"
+    if "Resynced to recognized screen" in text:
+        screen = text.rsplit(" ", 1)[-1].rstrip(".")
+        return f"已重新定位到流程画面：{screen}。"
+    if "Closing detect5 modal" in text:
+        return "正在关闭五王信息弹窗。"
+    if "Closing detect3 modal" in text:
+        return "正在关闭三王信息弹窗。"
+    if "expect=" in text and "iteration=" in text:
+        parts = dict(
+            item.split("=", 1)
+            for item in text.replace(",", " ").split()
+            if "=" in item
+        )
+        iteration = parts.get("iteration", "?")
+        expect = parts.get("expect", "?")
+        return f"第 {iteration} 轮：正在检查流程画面 {expect}。"
+    if "ADB is not ready" in text:
+        return "无法连接雷电模拟器。请确认雷电模拟器 9 已打开，并且 ADB 可以连接。"
+    if "Could not find LDPlayer" in text or "No visible LDPlayer" in text:
+        return "没有找到雷电模拟器窗口。请先打开雷电模拟器 9。"
+    if "Traceback" in text:
+        return "程序遇到错误，详情见下方技术日志。"
+    return text
+
+
+class ProgressLogStream:
+    def __init__(self, sink: "ProgressState") -> None:
+        self.sink = sink
+        self.buffer = ""
+
+    def write(self, text: str) -> int:
+        self.buffer += text
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            self.sink.add_log(line)
+        return len(text)
+
+    def flush(self) -> None:
+        if self.buffer.strip():
+            self.sink.add_log(self.buffer)
+        self.buffer = ""
+
+
+class ProgressState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.status = "running"
+        self.summary = "正在准备运行。"
+        self.logs: list[dict[str, str]] = []
+        self.error_detail = ""
+
+    def add_log(self, line: str) -> None:
+        raw = line.strip()
+        friendly = user_friendly_log(raw)
+        if not raw and not friendly:
+            return
+        with self.lock:
+            if friendly:
+                self.summary = friendly
+            self.logs.append(
+                {
+                    "time": time.strftime("%H:%M:%S"),
+                    "message": friendly or raw,
+                    "detail": raw,
+                }
+            )
+            self.logs = self.logs[-300:]
+
+    def finish_success(self) -> None:
+        with self.lock:
+            self.status = "success"
+            self.summary = "已成功找到符合条件的 Boss 组合。"
+            self.logs.append(
+                {
+                    "time": time.strftime("%H:%M:%S"),
+                    "message": self.summary,
+                    "detail": "success",
+                }
+            )
+
+    def finish_error(self, exc: BaseException) -> None:
+        message = user_friendly_error(exc)
+        with self.lock:
+            self.status = "error"
+            self.summary = message
+            self.error_detail = traceback.format_exc()
+            self.logs.append(
+                {
+                    "time": time.strftime("%H:%M:%S"),
+                    "message": message,
+                    "detail": str(exc),
+                }
+            )
+
+    def snapshot(self) -> dict[str, object]:
+        with self.lock:
+            return {
+                "status": self.status,
+                "summary": self.summary,
+                "logs": list(self.logs),
+                "errorDetail": self.error_detail,
+            }
+
+
+def user_friendly_error(exc: BaseException) -> str:
+    text = str(exc)
+    lower = text.lower()
+    if "adb is not ready" in lower or "adb" in lower:
+        return "无法连接雷电模拟器。请确认雷电模拟器 9 已打开，再重新开始。"
+    if "window" in lower or "ldplayer" in lower or "leidian" in lower:
+        return "没有找到雷电模拟器窗口。请先打开雷电模拟器 9。"
+    if "missing" in lower and "image" in lower:
+        return "缺少识别图片。请确认压缩包里的 PNG 文件没有被删除。"
+    return f"运行时遇到错误：{text}"
+
+
+def run_with_progress_ui(args: argparse.Namespace) -> int:
+    state = ProgressState()
+    close_event = threading.Event()
+
+    def render_page() -> bytes:
+        page = """
+        <!doctype html>
+        <html lang="zh-CN">
+        <head>
+          <meta charset="utf-8">
+          <title>运行状态 - PCR Rogue Helper</title>
+          <style>
+            body { font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; margin: 24px; color: #1f2937; background: #f8fafc; }
+            main { max-width: 980px; margin: 0 auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 22px; }
+            h1 { font-size: 22px; margin: 0 0 12px; }
+            .status { padding: 14px 16px; border-radius: 8px; margin-bottom: 16px; background: #eff6ff; border: 1px solid #bfdbfe; }
+            .status.success { background: #ecfdf5; border-color: #a7f3d0; color: #065f46; }
+            .status.error { background: #fef2f2; border-color: #fecaca; color: #991b1b; }
+            .status.running { color: #1d4ed8; }
+            .logs { height: 430px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; background: #111827; color: #e5e7eb; padding: 12px; }
+            .log { padding: 6px 0; border-bottom: 1px solid #374151; }
+            .time { color: #93c5fd; margin-right: 8px; }
+            .detail { color: #9ca3af; font-size: 12px; margin-top: 3px; }
+            button { font-size: 14px; padding: 8px 14px; cursor: pointer; border: 1px solid #9ca3af; border-radius: 6px; background: #fff; margin-top: 14px; }
+            .hint { color: #4b5563; margin-bottom: 16px; }
+          </style>
+        </head>
+        <body>
+          <main>
+            <h1>运行状态</h1>
+            <p class="hint">请保持雷电模拟器 9 打开。找到符合条件的组合后，这里会显示成功提示。</p>
+            <div id="statusBox" class="status running">正在启动...</div>
+            <div id="logs" class="logs"></div>
+            <button id="closeButton" type="button" onclick="finish()" disabled>关闭窗口</button>
+          </main>
+          <script>
+            async function refresh() {
+              const response = await fetch("/state");
+              const data = await response.json();
+              const statusBox = document.getElementById("statusBox");
+              statusBox.className = "status " + data.status;
+              statusBox.textContent = data.summary;
+              const logs = document.getElementById("logs");
+              logs.innerHTML = data.logs.map(item => `
+                <div class="log">
+                  <div><span class="time">${item.time}</span>${item.message}</div>
+                  ${item.detail && item.detail !== item.message ? `<div class="detail">${item.detail}</div>` : ""}
+                </div>
+              `).join("");
+              logs.scrollTop = logs.scrollHeight;
+              document.getElementById("closeButton").disabled = data.status === "running";
+              if (data.status === "running") setTimeout(refresh, 1000);
+            }
+            async function finish() {
+              await fetch("/close", { method: "POST" });
+              window.close();
+              document.body.innerHTML = "<main><h1>可以关闭此窗口</h1></main>";
+            }
+            refresh();
+          </script>
+        </body>
+        </html>
+        """
+        return page.encode("utf-8")
+
+    class ProgressHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def do_GET(self) -> None:
+            if self.path == "/state":
+                body = json.dumps(state.snapshot(), ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = render_page()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            if self.path == "/close":
+                close_event.set()
+                self.send_response(204)
+                self.end_headers()
+
+    run_args = argparse.Namespace(**vars(args))
+    run_args.launcher_ui = False
+    run_args.configure_combos = False
+    run_args.no_launcher_ui = True
+
+    def worker() -> None:
+        stream = ProgressLogStream(state)
+        try:
+            with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+                result = run(run_args)
+            stream.flush()
+            if result == 0:
+                state.finish_success()
+            else:
+                state.finish_error(RuntimeError(f"程序已退出，退出码：{result}"))
+        except BaseException as exc:
+            stream.flush()
+            state.finish_error(exc)
+
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), ProgressHandler) as server:
+        url = f"http://127.0.0.1:{server.server_port}/"
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
+        print(f"运行状态界面已打开：{url}")
+        webbrowser.open(url)
+        while worker_thread.is_alive():
+            time.sleep(0.5)
+        while not close_event.wait(0.5):
+            pass
+        server.shutdown()
+        thread.join(timeout=2.0)
+    return 0 if state.snapshot()["status"] == "success" else 1
+
+
 def print_targets(sequence: list[AnnotatedImage], detect3: AnnotatedImage, detect5: AnnotatedImage) -> None:
     print("Loaded target boxes:")
     for ref in sequence:
@@ -922,6 +1196,8 @@ def run(args: argparse.Namespace) -> int:
         if selected_combos is None:
             return 0
         ACTIVE_VALID_COMBOS = selected_combos
+        args.combo_config = str(combo_path)
+        return run_with_progress_ui(args)
     else:
         ACTIVE_VALID_COMBOS = default_or_configured_combos(args.combo_config)
     print(f"Valid combos: {sorted(ACTIVE_VALID_COMBOS)}")
