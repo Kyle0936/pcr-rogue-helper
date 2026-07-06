@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pcr_rogue_helper_screen.png
+valid_combos.json
+combo_test.json
+tmp_combo_test.json
+dist/
+release/
