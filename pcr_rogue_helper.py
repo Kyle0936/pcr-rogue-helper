@@ -12,13 +12,19 @@ No OpenCV or PyAutoGUI dependency is required.
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
+import html
+import http.server
 import io
 import json
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -27,7 +33,10 @@ import numpy as np
 from PIL import Image, ImageChops, ImageFilter, ImageGrab
 
 
-ROOT = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    ROOT = Path(__file__).resolve().parent
 DEFAULT_COMBO_CONFIG = ROOT / "valid_combos.json"
 DEFAULT_VALID_COMBOS = {
     ("boss51.png", "boss31.png"),
@@ -632,72 +641,148 @@ def configure_combos_ui(
     output_path: Path,
     initial_combos: set[tuple[str, str]],
 ) -> None:
-    try:
-        import tkinter as tk
-        from tkinter import messagebox
-        from PIL import ImageTk
-    except Exception as exc:
-        raise RuntimeError(f"Cannot open configuration UI: {exc}") from exc
-
-    root = tk.Tk()
-    root.title("有效组合设置")
-    root.resizable(False, False)
-
     boss3_names = sorted_boss_names(boss3_templates)
     boss5_names = sorted_boss_names(boss5_templates)
-    photos: list[object] = []
-    variables: dict[tuple[str, str], tk.BooleanVar] = {}
 
-    tk.Label(root, text="请选择有效组合", font=("Microsoft YaHei UI", 14, "bold")).grid(
-        row=0, column=0, columnspan=len(boss3_names) + 1, padx=12, pady=(12, 6)
-    )
-    tk.Label(root, text="五王\\三王").grid(row=1, column=0, padx=8, pady=6)
+    def icon_data_uri(image: Image.Image) -> str:
+        preview = image.resize((64, 64), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        preview.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
 
-    for col, boss3 in enumerate(boss3_names, start=1):
-        image = boss3_templates[boss3].resize((64, 64), Image.Resampling.LANCZOS)
-        photo = ImageTk.PhotoImage(image)
-        photos.append(photo)
-        frame = tk.Frame(root)
-        frame.grid(row=1, column=col, padx=6, pady=6)
-        tk.Label(frame, image=photo).pack()
-        tk.Label(frame, text=boss_display_name(boss3)).pack()
+    boss3_icons = {name: icon_data_uri(boss3_templates[name]) for name in boss3_names}
+    boss5_icons = {name: icon_data_uri(boss5_templates[name]) for name in boss5_names}
+    done = threading.Event()
+    result: dict[str, str] = {}
 
-    for row, boss5 in enumerate(boss5_names, start=2):
-        image = boss5_templates[boss5].resize((64, 64), Image.Resampling.LANCZOS)
-        photo = ImageTk.PhotoImage(image)
-        photos.append(photo)
-        frame = tk.Frame(root)
-        frame.grid(row=row, column=0, padx=8, pady=6)
-        tk.Label(frame, image=photo).pack()
-        tk.Label(frame, text=boss_display_name(boss5)).pack()
+    def checkbox_name(boss5: str, boss3: str) -> str:
+        return f"{boss5}|{boss3}"
 
-        for col, boss3 in enumerate(boss3_names, start=1):
-            var = tk.BooleanVar(value=(boss5, boss3) in initial_combos)
-            variables[(boss5, boss3)] = var
-            tk.Checkbutton(root, variable=var, text="有效").grid(row=row, column=col, padx=8, pady=8)
+    def render_page(saved: bool = False) -> bytes:
+        header_cells = []
+        for boss3 in boss3_names:
+            header_cells.append(
+                f"""
+                <th>
+                  <img src="{boss3_icons[boss3]}" alt="{html.escape(boss_display_name(boss3))}">
+                  <div>{html.escape(boss_display_name(boss3))}</div>
+                </th>
+                """
+            )
+        rows = []
+        for boss5 in boss5_names:
+            cells = []
+            for boss3 in boss3_names:
+                name = checkbox_name(boss5, boss3)
+                checked = " checked" if (boss5, boss3) in initial_combos else ""
+                cells.append(
+                    f'<td><label><input type="checkbox" name="{html.escape(name)}"{checked}> 有效</label></td>'
+                )
+            rows.append(
+                f"""
+                <tr>
+                  <th>
+                    <img src="{boss5_icons[boss5]}" alt="{html.escape(boss_display_name(boss5))}">
+                    <div>{html.escape(boss_display_name(boss5))}</div>
+                  </th>
+                  {''.join(cells)}
+                </tr>
+                """
+            )
+        notice = "<p class=\"notice\">已保存，可以关闭这个页面。</p>" if saved else ""
+        page = f"""
+        <!doctype html>
+        <html lang="zh-CN">
+        <head>
+          <meta charset="utf-8">
+          <title>有效组合设置</title>
+          <style>
+            body {{ font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; margin: 24px; color: #1f2937; }}
+            h1 {{ font-size: 22px; margin: 0 0 12px; }}
+            p {{ margin: 0 0 16px; color: #4b5563; }}
+            table {{ border-collapse: collapse; }}
+            th, td {{ border: 1px solid #d1d5db; padding: 10px 12px; text-align: center; min-width: 96px; }}
+            th {{ background: #f9fafb; font-weight: 600; }}
+            img {{ width: 64px; height: 64px; object-fit: contain; display: block; margin: 0 auto 6px; }}
+            label {{ cursor: pointer; white-space: nowrap; }}
+            .actions {{ display: flex; gap: 10px; margin-top: 18px; }}
+            button {{ font-size: 14px; padding: 8px 14px; cursor: pointer; }}
+            .notice {{ color: #047857; font-weight: 600; }}
+          </style>
+        </head>
+        <body>
+          <h1>请选择有效组合</h1>
+          <p>勾选后点击“保存并退出”。保存位置：{html.escape(str(output_path))}</p>
+          {notice}
+          <form method="post" action="/save">
+            <table>
+              <tr><th>五王 / 三王</th>{''.join(header_cells)}</tr>
+              {''.join(rows)}
+            </table>
+            <div class="actions">
+              <button type="submit">保存并退出</button>
+              <button type="submit" formaction="/defaults">恢复默认</button>
+              <button type="submit" formaction="/cancel">取消</button>
+            </div>
+          </form>
+        </body>
+        </html>
+        """
+        return page.encode("utf-8")
 
-    def select_defaults() -> None:
-        for key, var in variables.items():
-            var.set(key in DEFAULT_VALID_COMBOS)
+    class ComboHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
 
-    def save_and_exit() -> None:
-        combos = {key for key, var in variables.items() if var.get()}
-        save_combo_config(output_path, combos)
-        messagebox.showinfo("已保存", f"已保存到：{output_path}")
-        root.destroy()
+        def send_html(self, body: bytes) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-    button_row = len(boss5_names) + 2
-    tk.Button(root, text="恢复默认", command=select_defaults, width=12).grid(
-        row=button_row, column=0, padx=8, pady=12
-    )
-    tk.Button(root, text="保存并退出", command=save_and_exit, width=14).grid(
-        row=button_row, column=max(1, len(boss3_names) - 1), padx=8, pady=12
-    )
-    tk.Button(root, text="取消", command=root.destroy, width=12).grid(
-        row=button_row, column=len(boss3_names), padx=8, pady=12
-    )
+        def do_GET(self) -> None:
+            self.send_html(render_page())
 
-    root.mainloop()
+        def do_POST(self) -> None:
+            nonlocal initial_combos
+            length = int(self.headers.get("Content-Length", "0"))
+            fields = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
+            if self.path == "/cancel":
+                result["status"] = "cancelled"
+                done.set()
+                self.send_html(render_page())
+                return
+            if self.path == "/defaults":
+                initial_combos = set(DEFAULT_VALID_COMBOS)
+                self.send_html(render_page())
+                return
+            combos = {
+                (boss5, boss3)
+                for boss5 in boss5_names
+                for boss3 in boss3_names
+                if checkbox_name(boss5, boss3) in fields
+            }
+            save_combo_config(output_path, combos)
+            result["status"] = "saved"
+            done.set()
+            self.send_html(render_page(saved=True))
+
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), ComboHandler) as server:
+        url = f"http://127.0.0.1:{server.server_port}/"
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        print(f"配置界面已打开：{url}")
+        webbrowser.open(url)
+        done.wait()
+        server.shutdown()
+        thread.join(timeout=2.0)
+
+    if result.get("status") == "saved":
+        print(f"已保存到：{output_path}")
+    else:
+        print("已取消，未保存配置。")
 
 
 def print_targets(sequence: list[AnnotatedImage], detect3: AnnotatedImage, detect5: AnnotatedImage) -> None:

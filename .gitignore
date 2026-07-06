@@ -5,4 +5,6 @@ valid_combos.json
 combo_test.json
 tmp_combo_test.json
 dist/
+build/
+*.spec
 release/
