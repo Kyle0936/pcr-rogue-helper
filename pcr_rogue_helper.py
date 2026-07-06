@@ -640,7 +640,9 @@ def configure_combos_ui(
     boss5_templates: dict[str, Image.Image],
     output_path: Path,
     initial_combos: set[tuple[str, str]],
-) -> None:
+    *,
+    start_enabled: bool = False,
+) -> set[tuple[str, str]] | None:
     boss3_names = sorted_boss_names(boss3_templates)
     boss5_names = sorted_boss_names(boss5_templates)
 
@@ -654,78 +656,148 @@ def configure_combos_ui(
     boss3_icons = {name: icon_data_uri(boss3_templates[name]) for name in boss3_names}
     boss5_icons = {name: icon_data_uri(boss5_templates[name]) for name in boss5_names}
     done = threading.Event()
-    result: dict[str, str] = {}
+    result: dict[str, object] = {}
 
-    def checkbox_name(boss5: str, boss3: str) -> str:
-        return f"{boss5}|{boss3}"
+    def icon_select_options(names: list[str]) -> str:
+        return "".join(
+            f'<option value="{html.escape(name)}">{html.escape(boss_display_name(name))}</option>'
+            for name in names
+        )
 
     def render_page(saved: bool = False) -> bytes:
-        header_cells = []
-        for boss3 in boss3_names:
-            header_cells.append(
-                f"""
-                <th>
-                  <img src="{boss3_icons[boss3]}" alt="{html.escape(boss_display_name(boss3))}">
-                  <div>{html.escape(boss_display_name(boss3))}</div>
-                </th>
-                """
-            )
-        rows = []
-        for boss5 in boss5_names:
-            cells = []
-            for boss3 in boss3_names:
-                name = checkbox_name(boss5, boss3)
-                checked = " checked" if (boss5, boss3) in initial_combos else ""
-                cells.append(
-                    f'<td><label><input type="checkbox" name="{html.escape(name)}"{checked}> 有效</label></td>'
-                )
-            rows.append(
-                f"""
-                <tr>
-                  <th>
-                    <img src="{boss5_icons[boss5]}" alt="{html.escape(boss_display_name(boss5))}">
-                    <div>{html.escape(boss_display_name(boss5))}</div>
-                  </th>
-                  {''.join(cells)}
-                </tr>
-                """
-            )
-        notice = "<p class=\"notice\">已保存，可以关闭这个页面。</p>" if saved else ""
+        boss3_payload = json.dumps(boss3_icons, ensure_ascii=False)
+        boss5_payload = json.dumps(boss5_icons, ensure_ascii=False)
+        boss3_label_payload = json.dumps({name: boss_display_name(name) for name in boss3_names}, ensure_ascii=False)
+        boss5_label_payload = json.dumps({name: boss_display_name(name) for name in boss5_names}, ensure_ascii=False)
+        initial_payload = json.dumps(
+            [{"boss5": boss5, "boss3": boss3} for boss5, boss3 in sorted(initial_combos)],
+            ensure_ascii=False,
+        )
+        default_payload = json.dumps(
+            [{"boss5": boss5, "boss3": boss3} for boss5, boss3 in sorted(DEFAULT_VALID_COMBOS)],
+            ensure_ascii=False,
+        )
+        notice = "<p class=\"notice\">已保存。</p>" if saved else ""
+        start_button = '<button type="button" onclick="submitAction(\'start\')" class="primary">保存并开始</button>' if start_enabled else ""
         page = f"""
         <!doctype html>
         <html lang="zh-CN">
         <head>
           <meta charset="utf-8">
-          <title>有效组合设置</title>
+          <title>PCR Rogue Helper</title>
           <style>
-            body {{ font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; margin: 24px; color: #1f2937; }}
-            h1 {{ font-size: 22px; margin: 0 0 12px; }}
+            body {{ font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; margin: 24px; color: #1f2937; background: #f8fafc; }}
+            main {{ max-width: 980px; margin: 0 auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 22px; }}
+            h1 {{ font-size: 22px; margin: 0 0 8px; }}
             p {{ margin: 0 0 16px; color: #4b5563; }}
-            table {{ border-collapse: collapse; }}
-            th, td {{ border: 1px solid #d1d5db; padding: 10px 12px; text-align: center; min-width: 96px; }}
-            th {{ background: #f9fafb; font-weight: 600; }}
-            img {{ width: 64px; height: 64px; object-fit: contain; display: block; margin: 0 auto 6px; }}
-            label {{ cursor: pointer; white-space: nowrap; }}
-            .actions {{ display: flex; gap: 10px; margin-top: 18px; }}
-            button {{ font-size: 14px; padding: 8px 14px; cursor: pointer; }}
+            .combo-row {{ display: grid; grid-template-columns: 1fr 1fr auto; gap: 12px; align-items: end; padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 10px; }}
+            label {{ display: block; font-weight: 600; margin-bottom: 6px; }}
+            .selector {{ display: grid; grid-template-columns: 72px 1fr; gap: 10px; align-items: center; }}
+            img {{ width: 64px; height: 64px; object-fit: contain; border: 1px solid #d1d5db; border-radius: 6px; background: #fff; }}
+            select {{ width: 100%; font-size: 15px; padding: 8px; }}
+            button {{ font-size: 14px; padding: 8px 14px; cursor: pointer; border: 1px solid #9ca3af; border-radius: 6px; background: #fff; }}
+            .primary {{ background: #2563eb; color: #fff; border-color: #2563eb; }}
+            .danger {{ color: #b91c1c; border-color: #fecaca; }}
+            .actions {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }}
             .notice {{ color: #047857; font-weight: 600; }}
           </style>
         </head>
         <body>
-          <h1>请选择有效组合</h1>
-          <p>勾选后点击“保存并退出”。保存位置：{html.escape(str(output_path))}</p>
-          {notice}
-          <form method="post" action="/save">
-            <table>
-              <tr><th>五王 / 三王</th>{''.join(header_cells)}</tr>
-              {''.join(rows)}
-            </table>
+          <main>
+            <h1>PCR Rogue Helper</h1>
+            <p>请选择有效 Boss 组合。每一行是一组有效组合，可以添加或删除。</p>
+            {notice}
+            <div id="rows"></div>
             <div class="actions">
-              <button type="submit">保存并退出</button>
-              <button type="submit" formaction="/defaults">恢复默认</button>
-              <button type="submit" formaction="/cancel">取消</button>
+              <button type="button" onclick="addRow()">添加组合</button>
+              <button type="button" onclick="loadDefaults()">恢复默认</button>
+              <button type="button" onclick="submitAction('save')">保存组合</button>
+              {start_button}
+              <button type="button" onclick="submitAction('cancel')">取消</button>
             </div>
+          </main>
+          <form id="postForm" method="post" action="/action" hidden>
+            <input id="actionInput" name="action">
+            <input id="combosInput" name="combos">
           </form>
+          <script>
+            const boss3Icons = {boss3_payload};
+            const boss5Icons = {boss5_payload};
+            const boss3Labels = {boss3_label_payload};
+            const boss5Labels = {boss5_label_payload};
+            const boss3Names = Object.keys(boss3Icons);
+            const boss5Names = Object.keys(boss5Icons);
+            const defaults = {default_payload};
+            let combos = {initial_payload};
+
+            function optionHtml(names, labels) {{
+              return names.map(name => `<option value="${{name}}">${{labels[name]}}</option>`).join("");
+            }}
+
+            function renderRows() {{
+              const rows = document.getElementById("rows");
+              rows.innerHTML = "";
+              if (!combos.length) combos.push({{boss5: boss5Names[0], boss3: boss3Names[0]}});
+              combos.forEach((combo, index) => {{
+                const row = document.createElement("div");
+                row.className = "combo-row";
+                row.innerHTML = `
+                  <div>
+                    <label>五王</label>
+                    <div class="selector">
+                      <img class="boss5-icon" src="${{boss5Icons[combo.boss5]}}">
+                      <select class="boss5-select">${{optionHtml(boss5Names, boss5Labels)}}</select>
+                    </div>
+                  </div>
+                  <div>
+                    <label>三王</label>
+                    <div class="selector">
+                      <img class="boss3-icon" src="${{boss3Icons[combo.boss3]}}">
+                      <select class="boss3-select">${{optionHtml(boss3Names, boss3Labels)}}</select>
+                    </div>
+                  </div>
+                  <button type="button" class="danger">删除</button>
+                `;
+                const boss5Select = row.querySelector(".boss5-select");
+                const boss3Select = row.querySelector(".boss3-select");
+                boss5Select.value = combo.boss5;
+                boss3Select.value = combo.boss3;
+                boss5Select.onchange = () => {{
+                  combos[index].boss5 = boss5Select.value;
+                  row.querySelector(".boss5-icon").src = boss5Icons[boss5Select.value];
+                }};
+                boss3Select.onchange = () => {{
+                  combos[index].boss3 = boss3Select.value;
+                  row.querySelector(".boss3-icon").src = boss3Icons[boss3Select.value];
+                }};
+                row.querySelector(".danger").onclick = () => {{
+                  combos.splice(index, 1);
+                  renderRows();
+                }};
+                rows.appendChild(row);
+              }});
+            }}
+
+            function addRow() {{
+              combos.push({{boss5: boss5Names[0], boss3: boss3Names[0]}});
+              renderRows();
+            }}
+
+            function loadDefaults() {{
+              combos = defaults.map(item => ({{boss5: item.boss5, boss3: item.boss3}}));
+              renderRows();
+            }}
+
+            function submitAction(action) {{
+              const unique = new Map();
+              combos.forEach(item => unique.set(`${{item.boss5}}|${{item.boss3}}`, item));
+              document.getElementById("actionInput").value = action;
+              document.getElementById("combosInput").value = JSON.stringify([...unique.values()]);
+              document.getElementById("postForm").submit();
+            }}
+
+            renderRows();
+          </script>
         </body>
         </html>
         """
@@ -749,25 +821,30 @@ def configure_combos_ui(
             nonlocal initial_combos
             length = int(self.headers.get("Content-Length", "0"))
             fields = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
-            if self.path == "/cancel":
+            action = fields.get("action", ["save"])[0]
+            if action == "cancel":
                 result["status"] = "cancelled"
                 done.set()
                 self.send_html(render_page())
                 return
-            if self.path == "/defaults":
-                initial_combos = set(DEFAULT_VALID_COMBOS)
-                self.send_html(render_page())
-                return
-            combos = {
-                (boss5, boss3)
-                for boss5 in boss5_names
-                for boss3 in boss3_names
-                if checkbox_name(boss5, boss3) in fields
-            }
+            raw_combos = fields.get("combos", ["[]"])[0]
+            combos: set[tuple[str, str]] = set()
+            for item in json.loads(raw_combos):
+                boss5 = item.get("boss5") if isinstance(item, dict) else None
+                boss3 = item.get("boss3") if isinstance(item, dict) else None
+                if boss5 in boss5_names and boss3 in boss3_names:
+                    combos.add((boss5, boss3))
+            if not combos:
+                combos = set(DEFAULT_VALID_COMBOS)
+            initial_combos = set(combos)
             save_combo_config(output_path, combos)
-            result["status"] = "saved"
-            done.set()
+            result["status"] = "start" if action == "start" else "saved"
+            result["combos"] = combos
+            if action == "start":
+                done.set()
             self.send_html(render_page(saved=True))
+            if action == "save":
+                done.set()
 
     with http.server.ThreadingHTTPServer(("127.0.0.1", 0), ComboHandler) as server:
         url = f"http://127.0.0.1:{server.server_port}/"
@@ -781,8 +858,13 @@ def configure_combos_ui(
 
     if result.get("status") == "saved":
         print(f"已保存到：{output_path}")
+        return result.get("combos") if isinstance(result.get("combos"), set) else initial_combos
+    if result.get("status") == "start":
+        print(f"已保存到：{output_path}")
+        return result.get("combos") if isinstance(result.get("combos"), set) else initial_combos
     else:
         print("已取消，未保存配置。")
+        return None
 
 
 def print_targets(sequence: list[AnnotatedImage], detect3: AnnotatedImage, detect5: AnnotatedImage) -> None:
@@ -829,7 +911,19 @@ def run(args: argparse.Namespace) -> int:
         configure_combos_ui(boss3_templates, boss5_templates, combo_path, initial_combos)
         return 0
 
-    ACTIVE_VALID_COMBOS = default_or_configured_combos(args.combo_config)
+    if args.launcher_ui:
+        selected_combos = configure_combos_ui(
+            boss3_templates,
+            boss5_templates,
+            combo_path,
+            initial_combos,
+            start_enabled=True,
+        )
+        if selected_combos is None:
+            return 0
+        ACTIVE_VALID_COMBOS = selected_combos
+    else:
+        ACTIVE_VALID_COMBOS = default_or_configured_combos(args.combo_config)
     print(f"Valid combos: {sorted(ACTIVE_VALID_COMBOS)}")
 
     if args.print_targets:
@@ -1049,6 +1143,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Open the Chinese combo configuration UI, save the config, then exit.",
     )
     parser.add_argument(
+        "--launcher-ui",
+        action="store_true",
+        help="Open the Chinese launcher UI before starting automation.",
+    )
+    parser.add_argument(
+        "--no-launcher-ui",
+        action="store_true",
+        help="Skip the launcher UI when starting the packaged app without other arguments.",
+    )
+    parser.add_argument(
         "--combo-config",
         default=None,
         help="Path to a saved valid combo JSON config. Omit to use the built-in default rules.",
@@ -1085,7 +1189,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        return run(parse_args(argv or sys.argv[1:]))
+        actual_argv = sys.argv[1:] if argv is None else argv
+        args = parse_args(actual_argv)
+        if not actual_argv and getattr(sys, "frozen", False) and not args.no_launcher_ui:
+            args.launcher_ui = True
+        return run(args)
     except KeyboardInterrupt:
         print("Stopped by user.")
         return 130
