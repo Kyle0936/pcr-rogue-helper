@@ -68,11 +68,11 @@
 
 ### 为什么只提供一个压缩包？
 
-发布页面只需要下载 `pcr-rogue-helper-v0.2-windows-app.zip`。这个包里包含 `PCRRogueHelper.exe` 和识别用图片，是给普通用户直接使用的版本。
+发布页面只需要下载 `pcr-rogue-helper-v0.2-windows-app.zip`。这个包里包含 `PCRRogueHelper.exe` 和 `screenshots` 图片文件夹，是给普通用户直接使用的版本。
 
 ### 识别不准怎么办？
 
-重新截取对应步骤的图片，并替换同名文件，例如 `5.png`、`detect3.png`、`detect5.png`。红色方框或红圈只是手动标记，工具在识别画面时会自动忽略这些红色标记。
+重新截取对应步骤的图片，并替换 `screenshots` 文件夹里的同名文件，例如 `5.png`、`detect3.png`、`detect5.png`。红色方框或红圈只是手动标记，工具在识别画面时会自动忽略这些红色标记。
 
 ### 找到目标组合后会发生什么？
 

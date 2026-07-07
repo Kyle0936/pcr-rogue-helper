@@ -40,6 +40,7 @@ if getattr(sys, "frozen", False):
     ROOT = Path(sys.executable).resolve().parent
 else:
     ROOT = Path(__file__).resolve().parent
+ASSET_ROOT = ROOT / "screenshots" if (ROOT / "screenshots").exists() else ROOT
 DEFAULT_COMBO_CONFIG = ROOT / "valid_combos.json"
 DEFAULT_VALID_COMBOS = {
     ("boss51.png", "boss31.png"),
@@ -273,7 +274,7 @@ def sort_click_boxes(name: str, boxes: list[Box]) -> list[Box]:
 
 
 def load_annotated(name: str) -> AnnotatedImage:
-    path = ROOT / name
+    path = ASSET_ROOT / name
     image = Image.open(path).convert("RGB")
     boxes = sort_click_boxes(name, connected_red_boxes(image))
     if not boxes:
@@ -622,7 +623,7 @@ def valid_combo(boss5: str | None, boss3: str | None) -> bool:
 def load_boss_templates(prefix: str) -> dict[str, Image.Image]:
     return {
         path.name: Image.open(path).convert("RGB")
-        for path in sorted(ROOT.glob(f"{prefix}*.png"))
+        for path in sorted(ASSET_ROOT.glob(f"{prefix}*.png"))
     }
 
 
@@ -1065,7 +1066,7 @@ def user_friendly_error(exc: BaseException) -> str:
     if "window" in lower or "ldplayer" in lower or "leidian" in lower:
         return "没有找到雷电模拟器窗口。请先打开雷电模拟器 9。"
     if "missing" in lower and "image" in lower:
-        return "缺少识别图片。请确认压缩包里的 PNG 文件没有被删除。"
+        return "缺少识别图片。请确认 screenshots 文件夹里的 PNG 文件没有被删除。"
     return f"运行时遇到错误：{text}"
 
 
