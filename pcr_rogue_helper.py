@@ -19,10 +19,12 @@ import html
 import http.server
 import io
 import json
+import os
 import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -41,6 +43,8 @@ if getattr(sys, "frozen", False):
 else:
     ROOT = Path(__file__).resolve().parent
 ASSET_ROOT = ROOT / "screenshots" if (ROOT / "screenshots").exists() else ROOT
+if getattr(sys, "frozen", False):
+    os.chdir(tempfile.gettempdir())
 DEFAULT_COMBO_CONFIG = ROOT / "valid_combos.json"
 DEFAULT_VALID_COMBOS = {
     ("boss51.png", "boss31.png"),
@@ -498,7 +502,7 @@ def grab_adb(args: argparse.Namespace) -> Image.Image:
     # Some older Android/LDPlayer adb builds mangle binary data through
     # exec-out. Pulling the file is slower but reliable.
     remote = "/sdcard/pcr_rogue_helper_screen.png"
-    local = ROOT / ".pcr_rogue_helper_screen.png"
+    local = Path(tempfile.gettempdir()) / ".pcr_rogue_helper_screen.png"
     cap = adb_command(args, "shell", "screencap", "-p", remote, timeout=8.0)
     if cap.returncode != 0:
         err = cap.stderr.decode("utf-8", errors="replace").strip()
@@ -1128,6 +1132,11 @@ def run_with_progress_ui(args: argparse.Namespace) -> int:
               window.close();
               document.body.innerHTML = "<main><h1>可以关闭此窗口</h1></main>";
             }
+            function shutdownBackend() {
+              try { navigator.sendBeacon("/close", ""); } catch (error) {}
+            }
+            window.addEventListener("pagehide", shutdownBackend);
+            window.addEventListener("beforeunload", shutdownBackend);
             refresh();
           </script>
         </body>
@@ -1211,6 +1220,7 @@ def run_control_dashboard(
     state.set_status("idle", "请先设置有效组合，然后点击“保存并开始”。")
     control = AutomationControl()
     close_event = threading.Event()
+    last_heartbeat = {"time": time.time()}
     worker_ref: dict[str, threading.Thread | None] = {"thread": None}
     current_combos = set(initial_combos)
 
@@ -1404,6 +1414,12 @@ def run_control_dashboard(
               }}
               await refresh();
             }}
+            function heartbeat() {{
+              fetch("/heartbeat", {{ method: "POST", keepalive: true }}).catch(() => {{}});
+            }}
+            function shutdownBackend() {{
+              try {{ navigator.sendBeacon("/close", ""); }} catch (error) {{}}
+            }}
             async function refresh() {{
               const response = await fetch("/state");
               const data = await response.json();
@@ -1426,7 +1442,11 @@ def run_control_dashboard(
             }}
             renderRows();
             refresh();
+            heartbeat();
             setInterval(refresh, 1000);
+            setInterval(heartbeat, 1000);
+            window.addEventListener("pagehide", shutdownBackend);
+            window.addEventListener("beforeunload", shutdownBackend);
           </script>
         </body>
         </html>
@@ -1452,10 +1472,24 @@ def run_control_dashboard(
             self.send_bytes(render_page(), "text/html; charset=utf-8")
 
         def do_POST(self) -> None:
+            if self.path == "/heartbeat":
+                last_heartbeat["time"] = time.time()
+                self.send_response(204)
+                self.end_headers()
+                return
+            if self.path == "/close":
+                control.end()
+                state.set_status("ended", "工具正在关闭。")
+                close_event.set()
+                self.send_response(204)
+                self.end_headers()
+                return
             length = int(self.headers.get("Content-Length", "0"))
             fields = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
             action = fields.get("action", ["save"])[0]
             if action == "close":
+                control.end()
+                state.set_status("ended", "工具正在关闭。")
                 close_event.set()
             else:
                 combos = parse_combos(fields)
@@ -1492,7 +1526,10 @@ def run_control_dashboard(
         print(f"控制界面已打开：{url}")
         webbrowser.open(url)
         while not close_event.wait(0.5):
-            pass
+            if time.time() - last_heartbeat["time"] > 8.0:
+                control.end()
+                state.set_status("ended", "检测到控制页面已关闭，工具正在退出。")
+                close_event.set()
         control.end()
         server.shutdown()
         thread.join(timeout=2.0)
