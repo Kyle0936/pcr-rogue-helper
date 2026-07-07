@@ -50,6 +50,48 @@ DEFAULT_VALID_COMBOS = {
 }
 ACTIVE_VALID_COMBOS = set(DEFAULT_VALID_COMBOS)
 
+
+class AutomationControl:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.paused = False
+        self.ended = False
+
+    def pause(self) -> None:
+        with self.lock:
+            self.paused = True
+
+    def resume(self) -> None:
+        with self.lock:
+            self.paused = False
+
+    def end(self) -> None:
+        with self.lock:
+            self.ended = True
+            self.paused = False
+
+    def reset(self) -> None:
+        with self.lock:
+            self.paused = False
+            self.ended = False
+
+    def should_end(self) -> bool:
+        with self.lock:
+            return self.ended
+
+    def is_paused(self) -> bool:
+        with self.lock:
+            return self.paused
+
+    def wait_if_paused(self) -> bool:
+        while True:
+            with self.lock:
+                if self.ended:
+                    return False
+                if not self.paused:
+                    return True
+            time.sleep(0.25)
+
 DEFAULT_WINDOW_KEYWORDS = (
     "leidian",
     "ldplayer",
@@ -978,6 +1020,19 @@ class ProgressState:
                 }
             )
 
+    def set_status(self, status: str, summary: str) -> None:
+        with self.lock:
+            self.status = status
+            self.summary = summary
+            self.logs.append(
+                {
+                    "time": time.strftime("%H:%M:%S"),
+                    "message": summary,
+                    "detail": status,
+                }
+            )
+            self.logs = self.logs[-300:]
+
     def finish_error(self, exc: BaseException) -> None:
         message = user_friendly_error(exc)
         with self.lock:
@@ -1141,6 +1196,308 @@ def run_with_progress_ui(args: argparse.Namespace) -> int:
     return 0 if state.snapshot()["status"] == "success" else 1
 
 
+def run_control_dashboard(
+    args: argparse.Namespace,
+    boss3_templates: dict[str, Image.Image],
+    boss5_templates: dict[str, Image.Image],
+    combo_path: Path,
+    initial_combos: set[tuple[str, str]],
+) -> int:
+    global ACTIVE_VALID_COMBOS
+    boss3_names = sorted_boss_names(boss3_templates)
+    boss5_names = sorted_boss_names(boss5_templates)
+    state = ProgressState()
+    state.set_status("idle", "请先设置有效组合，然后点击“保存并开始”。")
+    control = AutomationControl()
+    close_event = threading.Event()
+    worker_ref: dict[str, threading.Thread | None] = {"thread": None}
+    current_combos = set(initial_combos)
+
+    def icon_data_uri(image: Image.Image) -> str:
+        preview = image.resize((64, 64), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        preview.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+
+    boss3_icons = {name: icon_data_uri(boss3_templates[name]) for name in boss3_names}
+    boss5_icons = {name: icon_data_uri(boss5_templates[name]) for name in boss5_names}
+
+    def combos_payload() -> list[dict[str, str]]:
+        return [{"boss5": boss5, "boss3": boss3} for boss5, boss3 in sorted(current_combos)]
+
+    def parse_combos(fields: dict[str, list[str]]) -> set[tuple[str, str]]:
+        raw = fields.get("combos", ["[]"])[0]
+        combos: set[tuple[str, str]] = set()
+        for item in json.loads(raw):
+            boss5 = item.get("boss5") if isinstance(item, dict) else None
+            boss3 = item.get("boss3") if isinstance(item, dict) else None
+            if boss5 in boss5_names and boss3 in boss3_names:
+                combos.add((boss5, boss3))
+        return combos or set(DEFAULT_VALID_COMBOS)
+
+    def save_and_apply_combos(combos: set[tuple[str, str]]) -> None:
+        global ACTIVE_VALID_COMBOS
+        nonlocal current_combos
+        current_combos = set(combos)
+        save_combo_config(combo_path, current_combos)
+        ACTIVE_VALID_COMBOS = set(current_combos)
+        state.add_log("已更新有效 Boss 组合。")
+
+    def worker() -> None:
+        run_args = argparse.Namespace(**vars(args))
+        run_args.launcher_ui = False
+        run_args.configure_combos = False
+        run_args.no_launcher_ui = True
+        run_args.combo_config = str(combo_path)
+        run_args.control = control
+        stream = ProgressLogStream(state)
+        try:
+            with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+                result = run(run_args)
+            stream.flush()
+            if control.should_end():
+                state.set_status("ended", "任务已结束。可以修改组合后重新开始。")
+            elif result == 0:
+                state.finish_success()
+            else:
+                state.finish_error(RuntimeError(f"程序已退出，退出码：{result}"))
+        except BaseException as exc:
+            stream.flush()
+            if control.should_end():
+                state.set_status("ended", "任务已结束。可以修改组合后重新开始。")
+            else:
+                state.finish_error(exc)
+
+    def start_worker() -> None:
+        existing = worker_ref.get("thread")
+        if existing is not None and existing.is_alive():
+            return
+        control.reset()
+        state.set_status("running", "正在启动自动流程。")
+        thread = threading.Thread(target=worker, daemon=True)
+        worker_ref["thread"] = thread
+        thread.start()
+
+    def render_page() -> bytes:
+        boss3_payload = json.dumps(boss3_icons, ensure_ascii=False)
+        boss5_payload = json.dumps(boss5_icons, ensure_ascii=False)
+        boss3_label_payload = json.dumps({name: boss_display_name(name) for name in boss3_names}, ensure_ascii=False)
+        boss5_label_payload = json.dumps({name: boss_display_name(name) for name in boss5_names}, ensure_ascii=False)
+        initial_payload = json.dumps(combos_payload(), ensure_ascii=False)
+        default_payload = json.dumps(
+            [{"boss5": boss5, "boss3": boss3} for boss5, boss3 in sorted(DEFAULT_VALID_COMBOS)],
+            ensure_ascii=False,
+        )
+        page = f"""
+        <!doctype html>
+        <html lang="zh-CN">
+        <head>
+          <meta charset="utf-8">
+          <title>PCR Rogue Helper</title>
+          <style>
+            body {{ font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; margin: 18px; color: #1f2937; background: #f8fafc; }}
+            main {{ max-width: 1100px; margin: 0 auto; display: grid; gap: 14px; }}
+            section {{ background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 18px; }}
+            h1 {{ font-size: 22px; margin: 0 0 8px; }}
+            h2 {{ font-size: 17px; margin: 0 0 12px; }}
+            p {{ margin: 0 0 12px; color: #4b5563; }}
+            .combo-row {{ display: grid; grid-template-columns: 1fr 1fr auto; gap: 12px; align-items: end; padding: 10px; border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 8px; }}
+            label {{ display: block; font-weight: 600; margin-bottom: 6px; }}
+            .selector {{ display: grid; grid-template-columns: 58px 1fr; gap: 10px; align-items: center; }}
+            img {{ width: 52px; height: 52px; object-fit: contain; border: 1px solid #d1d5db; border-radius: 6px; background: #fff; }}
+            select {{ width: 100%; font-size: 15px; padding: 8px; }}
+            button {{ font-size: 14px; padding: 8px 14px; cursor: pointer; border: 1px solid #9ca3af; border-radius: 6px; background: #fff; }}
+            button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+            .primary {{ background: #2563eb; color: #fff; border-color: #2563eb; }}
+            .danger {{ color: #b91c1c; border-color: #fecaca; }}
+            .actions {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }}
+            .status {{ padding: 12px 14px; border-radius: 8px; margin-bottom: 12px; background: #eff6ff; border: 1px solid #bfdbfe; }}
+            .status.success {{ background: #ecfdf5; border-color: #a7f3d0; color: #065f46; }}
+            .status.error {{ background: #fef2f2; border-color: #fecaca; color: #991b1b; }}
+            .status.paused {{ background: #fffbeb; border-color: #fde68a; color: #92400e; }}
+            .status.ended, .status.idle {{ background: #f3f4f6; border-color: #d1d5db; color: #374151; }}
+            .logs {{ height: 320px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; background: #111827; color: #e5e7eb; padding: 12px; }}
+            .log {{ padding: 6px 0; border-bottom: 1px solid #374151; }}
+            .time {{ color: #93c5fd; margin-right: 8px; }}
+            .detail {{ color: #9ca3af; font-size: 12px; margin-top: 3px; }}
+          </style>
+        </head>
+        <body>
+          <main>
+            <section>
+              <h1>PCR Rogue Helper</h1>
+              <p>上半部分设置成功条件和控制程序；下半部分显示运行状态。暂停或结束后，可以修改组合再继续。</p>
+              <h2>成功条件</h2>
+              <div id="rows"></div>
+              <div class="actions">
+                <button type="button" onclick="addRow()">添加组合</button>
+                <button type="button" onclick="loadDefaults()">恢复默认</button>
+                <button type="button" onclick="sendAction('save')">保存组合</button>
+                <button id="startButton" type="button" class="primary" onclick="sendAction('start')">保存并开始</button>
+                <button id="pauseButton" type="button" onclick="sendAction('pause')">暂停</button>
+                <button id="resumeButton" type="button" onclick="sendAction('resume')">继续</button>
+                <button id="endButton" type="button" class="danger" onclick="sendAction('end')">结束</button>
+                <button type="button" onclick="sendAction('close')">关闭工具</button>
+              </div>
+            </section>
+            <section>
+              <h2>运行状态</h2>
+              <div id="statusBox" class="status idle">等待开始。</div>
+              <div id="logs" class="logs"></div>
+            </section>
+          </main>
+          <form id="postForm" method="post" action="/action" hidden>
+            <input id="actionInput" name="action">
+            <input id="combosInput" name="combos">
+          </form>
+          <script>
+            const boss3Icons = {boss3_payload};
+            const boss5Icons = {boss5_payload};
+            const boss3Labels = {boss3_label_payload};
+            const boss5Labels = {boss5_label_payload};
+            const boss3Names = Object.keys(boss3Icons);
+            const boss5Names = Object.keys(boss5Icons);
+            const defaults = {default_payload};
+            let combos = {initial_payload};
+            let currentStatus = "idle";
+
+            function optionHtml(names, labels) {{
+              return names.map(name => `<option value="${{name}}">${{labels[name]}}</option>`).join("");
+            }}
+            function renderRows() {{
+              const rows = document.getElementById("rows");
+              rows.innerHTML = "";
+              if (!combos.length) combos.push({{boss5: boss5Names[0], boss3: boss3Names[0]}});
+              combos.forEach((combo, index) => {{
+                const row = document.createElement("div");
+                row.className = "combo-row";
+                row.innerHTML = `
+                  <div><label>五王</label><div class="selector"><img class="boss5-icon" src="${{boss5Icons[combo.boss5]}}"><select class="boss5-select">${{optionHtml(boss5Names, boss5Labels)}}</select></div></div>
+                  <div><label>三王</label><div class="selector"><img class="boss3-icon" src="${{boss3Icons[combo.boss3]}}"><select class="boss3-select">${{optionHtml(boss3Names, boss3Labels)}}</select></div></div>
+                  <button type="button" class="danger">删除</button>
+                `;
+                const boss5Select = row.querySelector(".boss5-select");
+                const boss3Select = row.querySelector(".boss3-select");
+                boss5Select.value = combo.boss5;
+                boss3Select.value = combo.boss3;
+                boss5Select.onchange = () => {{ combos[index].boss5 = boss5Select.value; row.querySelector(".boss5-icon").src = boss5Icons[boss5Select.value]; }};
+                boss3Select.onchange = () => {{ combos[index].boss3 = boss3Select.value; row.querySelector(".boss3-icon").src = boss3Icons[boss3Select.value]; }};
+                row.querySelector(".danger").onclick = () => {{ combos.splice(index, 1); renderRows(); }};
+                rows.appendChild(row);
+              }});
+            }}
+            function addRow() {{ combos.push({{boss5: boss5Names[0], boss3: boss3Names[0]}}); renderRows(); }}
+            function loadDefaults() {{ combos = defaults.map(item => ({{boss5: item.boss5, boss3: item.boss3}})); renderRows(); }}
+            async function sendAction(action) {{
+              const unique = new Map();
+              combos.forEach(item => unique.set(`${{item.boss5}}|${{item.boss3}}`, item));
+              const body = new URLSearchParams();
+              body.set("action", action);
+              body.set("combos", JSON.stringify([...unique.values()]));
+              await fetch("/action", {{ method: "POST", body }});
+              if (action === "close") {{
+                window.close();
+                document.body.innerHTML = "<main><section><h1>可以关闭此窗口</h1></section></main>";
+                return;
+              }}
+              await refresh();
+            }}
+            async function refresh() {{
+              const response = await fetch("/state");
+              const data = await response.json();
+              currentStatus = data.status;
+              const statusBox = document.getElementById("statusBox");
+              statusBox.className = "status " + data.status;
+              statusBox.textContent = data.summary;
+              const logs = document.getElementById("logs");
+              logs.innerHTML = data.logs.map(item => `
+                <div class="log">
+                  <div><span class="time">${{item.time}}</span>${{item.message}}</div>
+                  ${{item.detail && item.detail !== item.message ? `<div class="detail">${{item.detail}}</div>` : ""}}
+                </div>
+              `).join("");
+              logs.scrollTop = logs.scrollHeight;
+              document.getElementById("pauseButton").disabled = data.status !== "running";
+              document.getElementById("resumeButton").disabled = !["paused", "ended", "idle", "success", "error"].includes(data.status);
+              document.getElementById("endButton").disabled = !["running", "paused"].includes(data.status);
+              document.getElementById("startButton").textContent = ["running", "paused"].includes(data.status) ? "保存条件" : "保存并开始";
+            }}
+            renderRows();
+            refresh();
+            setInterval(refresh, 1000);
+          </script>
+        </body>
+        </html>
+        """
+        return page.encode("utf-8")
+
+    class DashboardHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def send_bytes(self, body: bytes, content_type: str) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            if self.path == "/state":
+                body = json.dumps(state.snapshot(), ensure_ascii=False).encode("utf-8")
+                self.send_bytes(body, "application/json; charset=utf-8")
+                return
+            self.send_bytes(render_page(), "text/html; charset=utf-8")
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            fields = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
+            action = fields.get("action", ["save"])[0]
+            if action == "close":
+                close_event.set()
+            else:
+                combos = parse_combos(fields)
+                if action in {"save", "start", "resume"}:
+                    save_and_apply_combos(combos)
+                if action == "save":
+                    state.set_status(state.snapshot()["status"], "组合已保存。")
+                elif action == "start":
+                    existing = worker_ref.get("thread")
+                    if existing is not None and existing.is_alive():
+                        state.set_status(state.snapshot()["status"], "组合已更新，将用于后续判断。")
+                    else:
+                        start_worker()
+                elif action == "pause":
+                    control.pause()
+                    state.set_status("paused", "已暂停。可以修改组合后点击“继续”。")
+                elif action == "resume":
+                    existing = worker_ref.get("thread")
+                    if existing is not None and existing.is_alive():
+                        control.resume()
+                        state.set_status("running", "已继续运行，并使用最新组合。")
+                    else:
+                        start_worker()
+                elif action == "end":
+                    control.end()
+                    state.set_status("ended", "正在结束任务。结束后可以修改组合再继续。")
+            self.send_response(204)
+            self.end_headers()
+
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), DashboardHandler) as server:
+        url = f"http://127.0.0.1:{server.server_port}/"
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        print(f"控制界面已打开：{url}")
+        webbrowser.open(url)
+        while not close_event.wait(0.5):
+            pass
+        control.end()
+        server.shutdown()
+        thread.join(timeout=2.0)
+    return 0
+
+
 def print_targets(sequence: list[AnnotatedImage], detect3: AnnotatedImage, detect5: AnnotatedImage) -> None:
     print("Loaded target boxes:")
     for ref in sequence:
@@ -1186,18 +1543,7 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     if args.launcher_ui:
-        selected_combos = configure_combos_ui(
-            boss3_templates,
-            boss5_templates,
-            combo_path,
-            initial_combos,
-            start_enabled=True,
-        )
-        if selected_combos is None:
-            return 0
-        ACTIVE_VALID_COMBOS = selected_combos
-        args.combo_config = str(combo_path)
-        return run_with_progress_ui(args)
+        return run_control_dashboard(args, boss3_templates, boss5_templates, combo_path, initial_combos)
     else:
         ACTIVE_VALID_COMBOS = default_or_configured_combos(args.combo_config)
     print(f"Valid combos: {sorted(ACTIVE_VALID_COMBOS)}")
@@ -1232,6 +1578,14 @@ def run(args: argparse.Namespace) -> int:
     last_skip = 0.0
 
     while True:
+        control = getattr(args, "control", None)
+        if control is not None:
+            if control.should_end():
+                print("用户已结束任务。")
+                return 0
+            if not control.wait_if_paused():
+                print("用户已结束任务。")
+                return 0
         step += 1
         if args.max_steps and step > args.max_steps:
             print(f"Reached --max-steps={args.max_steps}; exiting.")
@@ -1348,6 +1702,14 @@ def run(args: argparse.Namespace) -> int:
                 return 0
 
             for box in expected.boxes:
+                control = getattr(args, "control", None)
+                if control is not None:
+                    if control.should_end():
+                        print("用户已结束任务。")
+                        return 0
+                    if not control.wait_if_paused():
+                        print("用户已结束任务。")
+                        return 0
                 if args.click_mode == "adb":
                     click_box_adb(args, live, expected, box)
                 else:
